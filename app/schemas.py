@@ -664,6 +664,91 @@ class KvpErrorDetail(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# 匿名剂量 SR 的 CT 照射事件解析（GET /jobs/{id}/instances/{uid}/dose-events）
+# --------------------------------------------------------------------------- #
+class DoseEventItem(BaseModel):
+    index: int = Field(description="按 SR 内容顺序的 0 基事件序号")
+    ctdi_vol_mgy: float = Field(description="该事件的 CTDIvol（mGy）")
+    dlp_mgy_cm: float = Field(description="该事件的 DLP（mGy·cm）")
+
+
+class DoseEventsOut(BaseModel):
+    sop_instance_uid: str = Field(description="请求的匿名 SOPInstanceUID")
+    output_file: Optional[str] = Field(
+        default=None, description="任务 output 目录内的扁平文件名"
+    )
+    event_count: int = Field(description="解析出的 CT 照射事件数")
+    events: list[DoseEventItem] = Field(
+        description="按 SR 内容顺序排列的事件剂量（CTDIvol / DLP）"
+    )
+    total_dlp_mgy_cm: float = Field(
+        description="全部事件 DLP 之和（mGy·cm，math.fsum 精确求和）"
+    )
+
+
+class DoseEventProblemItem(BaseModel):
+    sop_instance_uid: Optional[str] = Field(
+        default=None, description="出问题的匿名 SOPInstanceUID（歧义时为该共同 UID）"
+    )
+    output_file: Optional[str] = Field(
+        default=None, description="可定位时给出任务 output 目录内的扁平文件名"
+    )
+    output_files: list[str] = Field(
+        default=[], description="ambiguous_output 时给出相互冲突的输出文件名"
+    )
+    reason: str = Field(
+        description=(
+            "not_dose_sr（实例不是 X-Ray Radiation Dose SR） | "
+            "missing_value（事件内缺少 CTDIvol 或 DLP） | "
+            "duplicate_value（事件内同一概念出现多次） | "
+            "non_finite_value（数值缺失/无法解析/非有限值） | "
+            "unit_mismatch（单位不是 mGy / mGy·cm） | "
+            "malformed_measurement（NUM 项缺少 MeasuredValueSequence） | "
+            "ambiguous_output（同一匿名 SOP UID 对应多份输出） | "
+            "unreadable（匿名输出不可读） | output_missing（磁盘文件缺失） | "
+            "sop_instance_uid_mismatch（文件内 SOP UID 与请求不符）"
+        )
+    )
+    event_index: Optional[int] = Field(
+        default=None, description="事件内容问题时给出按内容顺序的 0 基事件序号"
+    )
+    concept: Optional[str] = Field(
+        default=None, description="事件内容问题时给出概念：CTDIvol | DLP"
+    )
+    count: Optional[int] = Field(
+        default=None, description="duplicate_value 时该概念在事件内的出现次数"
+    )
+    raw_value: Optional[str] = Field(
+        default=None, description="non_finite_value 时 NumericValue 的原始文本"
+    )
+    expected_units: Optional[str] = Field(
+        default=None, description="unit_mismatch 时要求的单位（mGy / mGy·cm）"
+    )
+    actual_units: Optional[str] = Field(
+        default=None,
+        description="unit_mismatch 时实际单位编码（<方案>:<编码>，如 "
+        "DCM:113847 / UCUM:mGy.cm）；缺失单位编码时为 null",
+    )
+    sop_class_uid: Optional[str] = Field(
+        default=None, description="not_dose_sr 时回传文件实际的 SOPClassUID"
+    )
+    message: str
+
+
+class DoseEventsErrorDetail(BaseModel):
+    code: str = Field(
+        description="JOB_NOT_FOUND（404） | INSTANCE_NOT_FOUND（404） | "
+        "JOB_NOT_READY（409） | DOSE_SR_CONFLICT（409）"
+    )
+    message: str
+    sop_instance_uid: Optional[str] = None
+    conflict_count: Optional[int] = Field(
+        default=None, description="DOSE_SR_CONFLICT 时的问题明细条数"
+    )
+    problems: list[DoseEventProblemItem] = []
+
+
+# --------------------------------------------------------------------------- #
 # 跨任务合并下载单个匿名检查（POST /jobs/merged-study/download）
 # --------------------------------------------------------------------------- #
 class MergedStudyDownloadRequest(BaseModel):

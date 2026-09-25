@@ -15,6 +15,7 @@ from .anonymizer import JobResult
 from . import (
     consistency,
     dicomdir,
+    dose_events,
     geometry,
     kvp,
     merged_study,
@@ -31,6 +32,8 @@ from .schemas import (
     ConsistencyErrorDetail,
     CursorErrorDetail,
     DicomDirErrorDetail,
+    DoseEventsErrorDetail,
+    DoseEventsOut,
     FileOut,
     GeometryErrorDetail,
     JobOut,
@@ -65,6 +68,8 @@ app = FastAPI(
         "支持按匿名检查下载子集、跨多个同密钥任务合并下载同一检查、"
         "生成带 DICOMDIR 的离线阅片 ZIP、"
         "按匿名 SOPInstanceUID 渲染单帧灰度 PNG 预览供人工核对，"
+        "按匿名 SOPInstanceUID 解析 X-Ray Radiation Dose SR 的 CT 照射事件剂量"
+        "（CTDIvol/DLP 与事件 DLP 合计），"
         "按匿名 SeriesInstanceUID 统计 CT 管电压（KVP）逐帧分布以发现混用扫描参数，"
         "并支持对多个已完成任务做跨批次密钥指纹/伪名/UID 映射一致性核对。"
     ),
@@ -735,6 +740,54 @@ def download_instance_preview(job_id: str, sop_instance_uid: str) -> Response:
 
 
 @app.get(
+    "/jobs/{job_id}/instances/{sop_instance_uid}/dose-events",
+    response_model=DoseEventsOut,
+    tags=["jobs"],
+    summary=(
+        "按匿名 SOPInstanceUID 解析 X-Ray Radiation Dose SR 的 CT 照射事件剂量："
+        "递归 ContentSequence，以事件容器归集 CTDIvol/DLP 并求事件 DLP 合计"
+    ),
+    responses={
+        404: {"model": DoseEventsErrorDetail,
+              "description": "任务不存在/已过期，或该匿名 SOP UID 不在任务的成功输出中"},
+        409: {"model": DoseEventsErrorDetail,
+              "description": "任务未完成，或剂量 SR 冲突：实例非 X-Ray Radiation Dose SR、"
+                             "输出歧义/不可读/缺失、事件缺项/重复项/非有限数值/单位不符"
+                             "（不输出部分合计）"},
+    },
+)
+def get_instance_dose_events(job_id: str, sop_instance_uid: str) -> DoseEventsOut:
+    job = registry.get(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "JOB_NOT_FOUND",
+                "message": "任务不存在或已过期",
+                "sop_instance_uid": sop_instance_uid,
+            },
+        )
+    if job.status != "ready":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "JOB_NOT_READY",
+                "message": f"任务处理失败：{job.error}",
+                "sop_instance_uid": sop_instance_uid,
+            },
+        )
+
+    try:
+        report = dose_events.extract_dose_events(job, sop_instance_uid)
+    except dose_events.DoseEventsError as exc:
+        raise HTTPException(
+            status_code=exc.http_status, detail=exc.detail
+        ) from exc
+
+    return DoseEventsOut.model_validate(report)
+
+
+@app.get(
     "/jobs/{job_id}/dicomdir/download",
     tags=["jobs"],
     summary="下载带 DICOMDIR 的离线阅片 ZIP（按匿名伪名/UID 重建患者-检查-系列-实例层级）",
@@ -797,6 +850,7 @@ def root() -> dict:
             "GET /jobs/{job_id}/series/{series_instance_uid}/geometry",
             "GET /jobs/{job_id}/series/{series_instance_uid}/kvp",
             "GET /jobs/{job_id}/instances/{sop_instance_uid}/preview.png",
+            "GET /jobs/{job_id}/instances/{sop_instance_uid}/dose-events",
             "GET /health",
         ],
     }
