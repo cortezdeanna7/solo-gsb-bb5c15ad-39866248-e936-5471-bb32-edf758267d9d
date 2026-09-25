@@ -79,6 +79,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/jobs/{job_id}/series/{series_instance_uid}/geometry` | 按**匿名 SeriesInstanceUID** 分析单帧切片几何：方向余弦叉积法线、投影排序、中位数层间距与 `>1.5×` 异常缺口标记，冲突时返回含匿名 SOP UID 的明细 |
 | `GET` | `/jobs/{job_id}/series/{series_instance_uid}/kvp` | 按**匿名 SeriesInstanceUID** 统计 CT 管电压（KVP）逐帧分布：各电压帧数、缺失帧数与按匿名 SOP UID 排列的逐实例明细，便于发现同系列混用扫描参数 |
 | `GET` | `/jobs/{job_id}/instances/{sop_instance_uid}/preview.png` | 按**匿名 SOPInstanceUID** 返回实例影像的 8 位灰度 **PNG 预览**（未压缩、单帧、8/16 位 MONOCHROME1/2），供人工核对影像内容 |
+| `GET` | `/jobs/{job_id}/instances/{sop_instance_uid}/dose-events` | 按**匿名 SOPInstanceUID** 解析 **X-Ray Radiation Dose SR**：递归遍历 ContentSequence，按 DCM 编码的 CT 照射事件容器提取逐事件 CTDIvol（mGy）/ DLP（mGy·cm）并给出事件 DLP 合计；事件数据缺项/重复/非法/单位不符返回 `409` |
 | `GET` | `/health` | 健康检查 |
 
 ### 表单参数（`POST /jobs`）
@@ -628,6 +629,108 @@ else:
     print("缺失 KVP 帧数：", k["missing_kvp_frames"])
 ```
 
+### CT 剂量 SR 照射事件解析（`GET /jobs/{job_id}/instances/{sop_instance_uid}/dose-events`）
+
+匿名化完成后，如需核对某份 **X-Ray Radiation Dose SR**（CT 剂量报告）中的逐次照射剂量，
+可按**匿名 SOPInstanceUID** 解析该 SR 的 CT 照射事件。数据**只来自已完成任务 output
+目录中的匿名 DICOM 文件**，不重新解压或处理原始 ZIP。
+
+`sop_instance_uid` 必须是任务结果中的**匿名后** UID，取自 `GET /jobs/{id}` 响应里
+`files[].sop_instance_uid`（成功文件的 `output_name` 去掉 `.dcm` 也是它）。
+
+**解析规则**：
+
+1. 文件必须是 X-Ray Radiation Dose SR（`SOPClassUID = 1.2.840.10008.5.1.4.1.1.88.67`）
+   且含 `ContentSequence`；
+2. 递归遍历 `ContentSequence`：`ConceptNameCodeSequence` 为
+   **(113812, DCM, "CT Irradiation Event Data")** 的容器划定一个 CT 照射事件边界；
+3. 事件边界内（任意嵌套深度）的 **(113829, DCM, "CTDIvol")** 与
+   **(113838, DCM, "DLP")** NUM 项归属**最近（内层）事件**；事件边界之外的同类数值
+   （报告级累计值，如 CT Accumulated Dose Data 容器内的 CT Dose Length Product Total）
+   **一律忽略**，不进入事件也不参与合计；
+4. 每个事件必须恰好含一个 CTDIvol（单位 `mGy`）与一个 DLP（单位 `mGy.cm`，UCUM 编码）。
+
+成功响应（200）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `sop_instance_uid` / `output_file` | 请求的匿名 SOPInstanceUID / 被解析的扁平输出文件名 |
+| `event_count` | 解析出的 CT 照射事件数（SR 中无 CT 事件时合法返回 0） |
+| `total_dlp_mgy_cm` | 全部**事件** DLP 之和（mGy·cm）；报告级累计值不参与合计 |
+| `events[]` | 按 SR **内容顺序**排列的事件：`index`（0 基）、`ctdi_vol_mgy`、`dlp_mgy_cm` |
+
+```bash
+# 9) 取某个剂量 SR 的匿名 SOPInstanceUID，解析 CT 照射事件剂量（默认端口 8000）
+SR_UID=$(python3 -c "
+import json
+job=json.load(open('job.json'))
+print(next(f['sop_instance_uid'] for f in job['files'] if f['status']=='ok'))")
+
+curl -f "http://localhost:8000/jobs/$JOB_ID/instances/$SR_UID/dose-events" | python3 -m json.tool
+```
+
+```jsonc
+{
+  "sop_instance_uid": "2.25.1528…",
+  "output_file": "2.25.1528….dcm",
+  "event_count": 2,
+  "total_dlp_mgy_cm": 707.0,                 // 仅事件 DLP 之和，不含报告级累计值
+  "events": [
+    {"index": 0, "ctdi_vol_mgy": 12.5, "dlp_mgy_cm": 456.5},
+    {"index": 1, "ctdi_vol_mgy": 8.25, "dlp_mgy_cm": 250.5}
+  ]
+}
+```
+
+事件内**缺项、重复项、非有限数值或单位不符**时，接口**不输出部分事件或部分合计**，
+而是返回 `409`（`detail.code = DOSE_SR_CONFLICT`），在 `detail.problems[]` 中
+**一次性列出全部问题**，每条都带匿名 SOP UID、`event_index`、`quantity`
+（`ctdi_vol` / `dlp`）与机器可读 `reason`：
+
+| `reason` | 触发条件 |
+| --- | --- |
+| `missing_value` | 事件内缺少 CTDIvol / DLP 数值项 |
+| `duplicate_value` | 事件内同一量出现多次，无法确定唯一取值 |
+| `invalid_value` | 数值缺失或无法解析为有限数值（`numeric_value` 给出原始文本） |
+| `unit_mismatch` | 单位不符：CTDIvol 须为 `mGy`、DLP 须为 `mGy.cm`（`units` 给出实际单位） |
+| `unreadable` | 匿名输出不可读（损坏 / 截断 / 编码错误） |
+| `not_dose_sr` | 实例不是 X-Ray Radiation Dose SR，或缺少 `ContentSequence` |
+| `sop_instance_uid_mismatch` | 文件内 SOPInstanceUID 与请求的匿名 UID 不一致 |
+
+其余错误（`detail.code` 机器可读）：
+
+| 状态码 | `detail.code` | 触发条件 |
+| --- | --- | --- |
+| `404` | `JOB_NOT_FOUND` | 任务 ID 不存在或已过期 |
+| `404` | `INSTANCE_NOT_FOUND` | 该匿名 SOPInstanceUID 不在任务的成功输出中 |
+| `404` | `INSTANCE_OUTPUT_MISSING` | 任务记录有该输出但磁盘文件已不存在（`reason=output_missing`） |
+| `409` | `JOB_NOT_READY` | 任务 `status != ready`（匿名化处理失败） |
+| `409` | `AMBIGUOUS_INSTANCE_OUTPUT` | 同一匿名 SOP UID 对应多份输出文件（`output_files` 列出冲突文件） |
+
+Python 示例（含 404/409 处理）：
+
+```python
+resp = requests.get(
+    f"http://localhost:8000/jobs/{job_id}/instances/{anon_sop_uid}/dose-events"
+)
+if resp.status_code == 404:
+    print("任务或匿名实例不存在：", resp.json()["detail"]["code"])
+elif resp.status_code == 409:
+    detail = resp.json()["detail"]
+    print("无法解析剂量事件：", detail["code"])
+    for p in detail.get("problems", []):
+        # reason: missing_value | duplicate_value | invalid_value |
+        #         unit_mismatch | unreadable | not_dose_sr | sop_instance_uid_mismatch
+        print(p["reason"], "event:", p.get("event_index"), p.get("quantity"))
+else:
+    resp.raise_for_status()
+    d = resp.json()
+    for e in d["events"]:
+        print(f"事件 {e['index']}: CTDIvol {e['ctdi_vol_mgy']} mGy, "
+              f"DLP {e['dlp_mgy_cm']} mGy·cm")
+    print("事件 DLP 合计：", d["total_dlp_mgy_cm"], "mGy·cm")
+```
+
 ### 跨任务合并下载同一匿名检查（`POST /jobs/merged-study/download`）
 
 当同一个检查的实例被拆到**多个批次 ZIP** 上传时（只要使用**同一把稳定密钥**，
@@ -1166,9 +1269,10 @@ else:
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由（/jobs、/jobs/consistency-check、/jobs/merged-study/download、全量/检查子集下载、系列几何、系列 KVP 分布、实例 PNG 预览、/health）
+│   ├── main.py          # FastAPI 路由（/jobs、/jobs/consistency-check、/jobs/merged-study/download、全量/检查子集下载、系列几何、系列 KVP 分布、实例 PNG 预览、剂量 SR 照射事件、/health）
 │   ├── anonymizer.py    # 两遍扫描引擎：UID 映射、标签重写、递归序列、诊断、ZIP 打包
 │   ├── preview.py       # 按匿名 SOP UID 从成功输出渲染单帧 8 位灰度 PNG：Rescale→VOI 窗/极值拉伸→MONOCHROME1 反相
+│   ├── dose_events.py   # 按匿名 SOP UID 解析 X-Ray Radiation Dose SR：CT 照射事件容器边界、逐事件 CTDIvol/DLP 与事件 DLP 合计
 │   ├── dicomdir.py      # 从匿名输出重建 DICOMDIR 四级层级、稳定短 File ID、引用校验与阅片 ZIP
 │   ├── geometry.py      # 系列单帧切片几何：方向余弦叉积法线、投影排序、中位数层间距与 >1.5× 缺口标记
 │   ├── kvp.py           # 系列 CT 管电压逐帧分布：逐帧/共享功能组/顶层三级回退、各电压帧数与缺失帧数统计
@@ -1179,9 +1283,9 @@ else:
 │   ├── crypto.py        # HMAC 确定性派生：伪名、UID、日期偏移
 │   ├── tags.py          # Annex E 标签策略与参与一致性重写的 UID 标签集合
 │   ├── jobs.py          # 任务存储、线程池处理、TTL 清理
-│   ├── schemas.py       # 请求/响应模型（含一致性核对、分页、子集/合并/DICOMDIR/预览/几何/KVP 错误模型）
+│   ├── schemas.py       # 请求/响应模型（含一致性核对、分页、子集/合并/DICOMDIR/预览/几何/KVP/剂量事件错误模型）
 │   └── config.py        # 环境变量配置
-├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / 分页游标 / 检查子集 / 跨任务合并 / DICOMDIR / PNG 预览 / 系列几何 / 系列 KVP 分布（235 个用例）
+├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / 分页游标 / 检查子集 / 跨任务合并 / DICOMDIR / PNG 预览 / 系列几何 / 系列 KVP 分布 / 剂量 SR 照射事件（265 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
